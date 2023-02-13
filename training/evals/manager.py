@@ -1,7 +1,6 @@
 
-# Submit job to the remote cluster
-
 import yaml
+import torch
 import sys
 import time
 import random
@@ -14,7 +13,11 @@ def load_yaml_conf(yaml_file):
     return data
 
 def process_cmd(yaml_file):
+    print(torch.__version__)
 
+    print(torch.version.cuda)
+    print(torch.backends.cudnn.version())
+    print(torch.cuda.nccl.version())
     yaml_conf = load_yaml_conf(yaml_file)
 
     ps_ip = yaml_conf['ps_ip']
@@ -51,7 +54,7 @@ def process_cmd(yaml_file):
 
     cmd_sufix = f" "
 
-
+    print(setup_cmd)
     for conf_name in job_conf:
         conf_script = conf_script + f' --{conf_name}={job_conf[conf_name]}'
         if conf_name == "job_name":
@@ -62,14 +65,14 @@ def process_cmd(yaml_file):
     learner_conf = '-'.join([str(_) for _ in list(range(1, sum(total_gpus)+1))])
     # =========== Submit job to parameter server ============
     running_vms.add(ps_ip)
-    ps_cmd = f" python {yaml_conf['exp_path']}/param_server.py {conf_script} --this_rank=0 --learner={learner_conf} "
+    ps_cmd = f" export NCCL_IB_DISABLE=1; export NCCL_P2P_DISABLE=1; NCCL_DEBUG=INFO python {yaml_conf['exp_path']}/param_server.py {conf_script} --this_rank=0 --learner={learner_conf} "
 
     with open(f"{job_name}_logging", 'wb') as fout:
         pass
         
     print(f"Starting aggregator on {ps_ip}...")
     with open(f"{job_name}_logging", 'a') as fout:
-        subprocess.Popen(f'ssh {submit_user}{ps_ip} "{setup_cmd} {ps_cmd}"',
+        subprocess.Popen(f'sshpass -p yuning123 ssh -o StrictHostKeyChecking=no {submit_user}{ps_ip}  "{setup_cmd} {ps_cmd}"',
                         shell=True, stdout=fout, stderr=fout)
 
     #time.sleep(2)
@@ -81,11 +84,11 @@ def process_cmd(yaml_file):
         for _  in range(gpu):
             time.sleep(1)
 
-            worker_cmd = f" python {yaml_conf['exp_path']}/learner.py {conf_script} --this_rank={rank_id} --learner={learner_conf} "
+            worker_cmd = f"export NCCL_IB_DISABLE=1; export NCCL_P2P_DISABLE=1; NCCL_DEBUG=INFO python {yaml_conf['exp_path']}/learner.py {conf_script} --this_rank={rank_id} --learner={learner_conf} "
             rank_id += 1
 
             with open(f"{job_name}_logging", 'a') as fout:
-                subprocess.Popen(f'ssh {submit_user}{worker} "{setup_cmd} {worker_cmd}"',
+                subprocess.Popen(f'sshpass -p yuning123 ssh -o StrictHostKeyChecking=no {submit_user}{worker}  "{setup_cmd} {worker_cmd}"',
                                 shell=True, stdout=fout, stderr=fout)
 
     # dump the address of running workers
@@ -111,7 +114,7 @@ def terminate(job_name):
     for vm_ip in job_meta['vms']:
         # os.system(f'scp shutdown.py {job_meta["user"]}{vm_ip}:~/')
         print(f"Shutting down job on {vm_ip}")
-        os.system(f"ssh {job_meta['user']}{vm_ip} 'python {current_path}/shutdown.py {job_name}'")
+        os.system(f"sshpass -p yuning123 ssh -o StrictHostKeyChecking=no {job_meta['user']}{vm_ip} 'python {current_path}/shutdown.py {job_name}'")
 
 if sys.argv[1] == 'submit':
     process_cmd(sys.argv[2])

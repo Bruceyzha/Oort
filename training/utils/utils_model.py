@@ -272,7 +272,7 @@ def accuracy(output, target, topk=(1,)):
         #logging.info(f"====Target:{target.cpu().numpy().flatten()}")
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k)
 
             #logging.info(f"====top: {k}, sum: {correct_k.item()}, predictions: {correct[:k].cpu().numpy().sum(0).flatten()}")
@@ -294,4 +294,3 @@ class RandomParams(object):
         part_len = int(math.floor(self.ratio * len(params_indices)))
         result = indexes[0: part_len]
         return [params_indices[i] for i in result]
-

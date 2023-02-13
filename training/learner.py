@@ -5,8 +5,9 @@ initiate_client_setting()
 
 for i in range(torch.cuda.device_count()):
     try:
-        device = torch.device('cuda:'+str(i))
-        torch.cuda.set_device(i)
+        device = torch.device('cuda:'+str(args.this_rank))
+        torch.cuda.set_device(args.this_rank)
+        logging.info(f'rank:{args.this_rank}')
         logging.info(f'End up with cuda device {torch.rand(1).to(device=device)}')
         break
     except Exception as e:
@@ -162,12 +163,13 @@ def run_client(clientId, cmodel, iters, learning_rate, argdicts = {}):
             },
             {"params": [p for n, p in cmodel.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
         ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, eps=args.adam_epsilon, weight_decay=5e-4)
+        # optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, eps=args.adam_epsilon, weight_decay=5e-4)
+        optimizer = MySGD(cmodel.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4)
 
     criterion = None
 
     if args.task == 'voice':
-        criterion = CTCLoss(reduction='none').to(device=device)
+        criterion = None
     else:
         criterion = torch.nn.CrossEntropyLoss(reduction='none').to(device=device)
 
@@ -653,7 +655,7 @@ if __name__ == "__main__":
     # Initialize PS - client communication channel
     world_size = len(workers) + 1
     this_rank = args.this_rank
-    dist.init_process_group(args.backend, rank=this_rank, world_size=world_size)
+    dist.init_process_group(args.backend,init_method='env://', rank=this_rank, world_size=world_size)
 
     # Split the dataset
     # total_worker != 0 indicates we create more virtual clients for simulation

@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 from fl_aggregator_libs import *
 from random import Random
-
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
 initiate_aggregator_setting()
 
 for i in range(torch.cuda.device_count()):
     try:
         device = torch.device('cuda:'+str(i))
-        torch.cuda.set_device(i)
+        torch.cuda.set_device(args.this_rank)
         logging.info(f'End up with cuda device {torch.rand(1).to(device=device)}')
         break
     except Exception as e:
@@ -20,7 +22,37 @@ sampledClientSet = set()
 
 os.environ['MASTER_ADDR'] = args.ps_ip
 os.environ['MASTER_PORT'] = args.ps_port
-#os.environ['NCCL_DEBUG'] = 'INFO'
+os.environ['NCCL_DEBUG'] = 'INFO'
+
+def plot_acc(acc,train_round,args):
+    # train_round = []
+    # for i in range(0,args.epochs-1):
+    #     train_round.append(i)
+    plt.plot(train_round,acc,linewidth = 2.0, color = 'g')
+    plt.xlabel("train_round")
+    plt.ylabel("acc")
+    title = args.sample_mode + "__selection supervised"
+    plt.title(title)
+    plt.savefig("./" + title)
+    plt.show()
+    print("plot success")
+
+def test_img(net_g, data_loader):
+    net_g.eval()
+    test_loss = 0
+    correct = 0
+    
+    for idx, (data, target) in enumerate(data_loader):
+        data, target = data.cuda(), target.cuda()
+        log_probs = net_g(data)
+        test_loss += F.cross_entropy(log_probs, target, reduction='sum',ignore_index=-1).item()
+        y_pred = log_probs.data.max(1, keepdim=True)[1]
+        correct += y_pred.eq(target.data.view_as(y_pred)).long().cpu().sum()
+
+    test_loss /= len(data_loader.dataset)
+    accuracy = 100.00 * correct / len(data_loader.dataset)
+    
+    return accuracy, test_loss
 
 def initiate_sampler_query(queue, numOfClients):
     # Initiate the clientSampler
@@ -59,7 +91,15 @@ def initiate_sampler_query(queue, numOfClients):
                 for index, dis in enumerate(distanceVec):
                     # since the worker rankId starts from 1, we also configure the initial dataId as 1
                     mapped_id = max(1, clientId%num_client_profile)
-                    systemProfile = global_client_profile[mapped_id] if mapped_id in global_client_profile else [1.0, 1.0]
+                    # systemProfileDict = global_client_profile[mapped_id] if mapped_id in global_client_profile else [1.0, 1.0]
+                    # print(systemProfile)
+                    systemProfile = []
+                    if mapped_id in global_client_profile:
+                        systemProfile.append(global_client_profile[mapped_id]['computation'])
+                        systemProfile.append(global_client_profile[mapped_id]['communication'])
+                    else:
+                        systemProfile = [1.0,1.0]
+                    print(systemProfile)
                     client_sampler.registerClient(rank_src, clientId, dis, sizeVec[index], speed=systemProfile)
                     client_sampler.registerDuration(clientId,
                         batch_size=args.batch_size, upload_epoch=args.upload_epoch,
@@ -75,10 +115,10 @@ def initiate_sampler_query(queue, numOfClients):
 
     return client_sampler
 
-def init_myprocesses(rank, size, model, queue, param_q, stop_signal, fn, backend):
+def init_myprocesses(rank, size, model,test_dataset, queue, param_q, stop_signal, fn, backend):
     global sampledClientSet
 
-    dist.init_process_group(backend, rank=rank, world_size=size)
+    dist.init_process_group(backend,init_method='env://', rank=rank, world_size=size)
 
     # After collecting all data information, then decide the clientId to run
     workerRanks = [int(v) for v in str(args.learners).split('-')]
@@ -95,7 +135,7 @@ def init_myprocesses(rank, size, model, queue, param_q, stop_signal, fn, backend
     dist.broadcast(tensor=clientTensor, src=0)
 
     # Start the PS service
-    fn(model, queue, param_q, stop_signal, clientSampler)
+    fn(model,test_dataset, queue, param_q, stop_signal, clientSampler)
 
 def prune_client_tasks(clientSampler, sampledClientsRealTemp, numToRealRun, global_virtual_clock):
 
@@ -129,13 +169,23 @@ def prune_client_tasks(clientSampler, sampledClientsRealTemp, numToRealRun, glob
 
     return clients_to_run, dummy_clients, virtual_client_clock, round_duration
 
-def run(model, queue, param_q, stop_signal, clientSampler):
+def run(model,test_dataset, queue, param_q, stop_signal, clientSampler):
     global logDir, sampledClientSet
 
     logging.info("====PS: get in run()")
-
+    print("test set length: ",len(test_dataset))
     model = model.to(device=device)
-
+    dataloader_kwargs = {
+        'batch_size': 128,
+        'drop_last': True,
+        'pin_memory': False,
+        'num_workers': 2,
+    }
+    test_loader = torch.utils.data.DataLoader(
+                test_dataset,
+                shuffle=False,
+                **dataloader_kwargs
+            )
     #if not args.load_model:
     for name, param in model.named_parameters():
         dist.broadcast(tensor=param.data.to(device=device), src=0)
@@ -158,7 +208,8 @@ def run(model, queue, param_q, stop_signal, clientSampler):
     virtualClientClock = {}
     exploredPendingWorkers = []
     avgUtilLastEpoch = 0.
-
+    acc_list = []
+    train_round = []
     s_time = time.time()
     epoch_time = s_time
 
@@ -303,7 +354,13 @@ def run(model, queue, param_q, stop_signal, clientSampler):
                                 top_5_str: round(test_results[updateEpoch][1]/test_results[updateEpoch][3]*100.0, 4),
                                 'loss': test_results[updateEpoch][2]/test_results[updateEpoch][3],
                                 }
-
+                            acc_list.append(round(test_results[updateEpoch][0]/test_results[updateEpoch][3]*100.0, 4))
+                            train_round.append(epoch_count)
+                            f = open("/data/yuning_/supervised_oort/Oort/training/acc.txt",'a')
+                            f.write(str(round(test_results[updateEpoch][0]/test_results[updateEpoch][3]*100.0, 4)))
+                            f.write("\n")
+                            # f.read()
+                            f.close()
                             with open(os.path.join(logDir, 'training_perf'), 'wb') as fout:
                                 pickle.dump(training_history, fout)
 
@@ -431,8 +488,9 @@ def run(model, queue, param_q, stop_signal, clientSampler):
                     for idx, param in enumerate(model.parameters()):
                         if not args.test_only:
                             param.data += sumDeltaWeights[idx]
+                        # dist.broadcast(tensor=(param.data.to(device=device)), src=0)
+                    for idx, param in enumerate(model.parameters()):
                         dist.broadcast(tensor=(param.data.to(device=device)), src=0)
-
                     dist.broadcast(tensor=torch.tensor(clientIdsToRun, dtype=torch.int).to(device=device), src=0)
                     dist.broadcast(tensor=torch.tensor(clientsList, dtype=torch.int).to(device=device), src=0)
                     last_model_parameters = [torch.clone(p.data) for p in model.parameters()]
@@ -456,6 +514,7 @@ def run(model, queue, param_q, stop_signal, clientSampler):
 
                 # The training stop
                 if(epoch_count >= args.epochs):
+                    plot_acc(acc_list,train_round,args)
                     stop_signal.put(1)
                     logging.info('Epoch is done: {}'.format(epoch_count))
                     break
@@ -512,7 +571,7 @@ if __name__ == "__main__":
     world_size = len(str(args.learners).split('-')) + 1
     this_rank = args.this_rank
 
-    init_myprocesses(this_rank, world_size, model,
+    init_myprocesses(this_rank, world_size, model,test_dataset,
                     q, param_q, stop_signal, run, args.backend
                 )
 
