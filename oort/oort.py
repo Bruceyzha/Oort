@@ -253,12 +253,18 @@ class _training_selector(object):
         if clientId in self.totalArms:
             self.totalArms[clientId]['duration'] = duration
 
+    def checkClients(self,feasible_clients):
+        client_list = list(self.totalArms.keys())
+        orderedKeys = [x for x in client_list if int(x) in feasible_clients]
+        for clientId in orderedKeys:
+            if self.totalArms[clientId]['reward'] <= 0:
+                return False
+        return True
+
     def getTopK(self, numOfSamples, cur_time, feasible_clients):
         self.training_round = cur_time
         self.blacklist = self.get_blacklist()
-
         self.pacer()
-
         # normalize the score of all arms: Avg + Confidence
         scores = {}
         numOfExploited = 0
@@ -266,7 +272,6 @@ class _training_selector(object):
 
         client_list = list(self.totalArms.keys())
         orderedKeys = [x for x in client_list if int(x) in feasible_clients and int(x) not in self.blacklist]
-
 
         if self.round_threshold < 100.:
             sortedDuration = sorted([self.totalArms[key]['duration'] for key in client_list])
@@ -277,15 +282,14 @@ class _training_selector(object):
         moving_reward, staleness, allloss = [], [], {}
 
         for clientId in orderedKeys:
+            logging.info("reward {} {} {}".format(clientId, self.totalArms[clientId]['reward'],self.totalArms[clientId]['duration']))
             if self.totalArms[clientId]['reward'] > 0:
                 creward = self.totalArms[clientId]['reward']
                 moving_reward.append(creward)
                 staleness.append(cur_time - self.totalArms[clientId]['time_stamp'])
 
-
         max_reward, min_reward, range_reward, avg_reward, clip_value = self.get_norm(moving_reward, self.args.clip_bound)
         max_staleness, min_staleness, range_staleness, avg_staleness, _ = self.get_norm(staleness, thres=1)
-
         for key in orderedKeys:
             # we have played this arm before
             if self.totalArms[key]['count'] > 0:
@@ -307,29 +311,29 @@ class _training_selector(object):
 
                 scores[key] = sc
 
-
         clientLakes = list(scores.keys())
         self.exploration = max(self.exploration*self.decay_factor, self.exploration_min)
         exploitLen = min(int(numOfSamples*(1.0 - self.exploration)), len(clientLakes))
-
         # take the top-k, and then sample by probability, take 95% of the cut-off loss
         sortedClientUtil = sorted(scores, key=scores.get, reverse=True)
 
         # take cut-off utility
         cut_off_util = scores[sortedClientUtil[exploitLen]] * self.args.cut_off_util
-
+        logging.info("problem7")
         pickedClients = []
+        logging.info("problem7 {} ".format(scores))
         for clientId in sortedClientUtil:
             if scores[clientId] < cut_off_util:
                 break
             pickedClients.append(clientId)
 
         augment_factor = len(pickedClients)
-
+        logging.info("problem8 {} {}".format(len(pickedClients),exploitLen))
         totalSc = max(1e-4, float(sum([scores[key] for key in pickedClients])))
         pickedClients = list(np2.random.choice(pickedClients, exploitLen, p=[scores[key]/totalSc for key in pickedClients], replace=False))
         self.exploitClients = pickedClients
-
+        # logging.info("picked client {}".format(len(pickedClients)))
+        logging.info("picked client {}".format(len(pickedClients)))
         # exploration
         if len(self.unexplored) > 0:
             _unexplored = [x for x in list(self.unexplored) if int(x) in feasible_clients]
@@ -353,6 +357,8 @@ class _training_selector(object):
 
             self.exploreClients = pickedUnexplored
             pickedClients = pickedClients + pickedUnexplored
+            logging.info("picked client {}".format(len(pickedClients)))
+            # print("picked client",len(pickedClients))
         else:
             # no clients left for exploration
             self.exploration_min = 0.
@@ -362,7 +368,8 @@ class _training_selector(object):
             nextId = self.rng.choice(orderedKeys)
             if nextId not in pickedClients:
                 pickedClients.append(nextId)
-
+        logging.info("picked client {}".format(len(pickedClients)))
+        # print("picked client",len(pickedClients))
         top_k_score = []
         for i in range(min(3, len(pickedClients))):
             clientId = pickedClients[i]

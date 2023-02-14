@@ -162,20 +162,22 @@ class clientSampler(object):
     def isClientActive(self, clientId, cur_time):
         return self.Clients[self.getUniqueId(0, clientId)].isActive(cur_time)
 
-    def resampleClients(self, numOfClients, cur_time=0):
+        def resampleClients(self, numOfClients, cur_time=0):
         self.count += 1
 
         feasible_clients = self.getFeasibleClients(cur_time)
-
+        print("start to resample ", len(feasible_clients),numOfClients)
         if len(feasible_clients) <= numOfClients:
             return feasible_clients
 
         pickled_clients = None
         feasible_clients_set = set(feasible_clients)
-
-        if self.mode == "oort" and self.count > 1:
+        print(self.mode)
+        if self.mode == "oort" and self.count > 1 and self.ucbSampler.checkClients(feasible_clients_set) == True:
+            print("start use oort", numOfClients)
             pickled_clients = self.ucbSampler.select_participant(numOfClients, feasible_clients=feasible_clients_set)
         else:
+            print("random")
             self.rng.shuffle(feasible_clients)
             client_len = min(numOfClients, len(feasible_clients) -1)
             pickled_clients = feasible_clients[:client_len]

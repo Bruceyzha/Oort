@@ -60,7 +60,6 @@ def init_dataset():
                 }
 
     logging.info("====Initialize the model")
-
     if args.task == 'nlp':
         # we should train from scratch
         config = AutoConfig.from_pretrained(os.path.join(args.data_dir, 'albert-base-v2-config.json'))
@@ -122,7 +121,11 @@ def init_dataset():
                            audio_conf=audio_conf,
                            bidirectional=args.bidirectional)
     else:
-        model = tormodels.__dict__[args.model](num_classes=outputClass[args.data_set])
+        if args.model == 'resnet9':
+            from utils.models import resnet9
+            model = resnet9()
+        else:
+            model = tormodels.__dict__[args.model](num_classes=outputClass[args.data_set])
 
     if args.load_model:
         try:
@@ -171,12 +174,12 @@ def init_dataset():
         test_dataset = FEMNIST(args.data_dir, train=False, transform=test_transform)
 
     elif args.data_set == 'openImg':
-        from utils.openImg import OPENIMG
+        from utils.openImg import OpenImage
 
         transformer_ns = 'openImg' if args.model != 'inception_v3' else 'openImgInception'
         train_transform, test_transform = get_data_transform(transformer_ns)
-        train_dataset = OPENIMG(args.data_dir, train=True, transform=train_transform)
-        test_dataset = OPENIMG(args.data_dir, train=False, transform=test_transform)
+        train_dataset = OpenImage(args.data_dir, dataset='train', transform=train_transform)
+        test_dataset = OpenImage(args.data_dir, dataset='test', transform=test_transform)
 
     elif args.data_set == 'blog':
         train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
