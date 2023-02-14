@@ -1,644 +1,641 @@
 # -*- coding: utf-8 -*-
-from fl_aggregator_libs import *
-from random import Random
-import matplotlib.pyplot as plt
-from augmentations import get_aug, get_aug_fedmatch
-from torch.utils.data import DataLoader, Dataset
-import torch.nn.functional as F
-initiate_aggregator_setting()
+from fl_client_libs import *
+from torch.autograd import Variable
+import torch.nn.functional as F 
+
+initiate_client_setting()
 
 for i in range(torch.cuda.device_count()):
     try:
-        device = torch.device('cuda:'+str(i))
+        device = torch.device('cuda:'+str(args.this_rank))
         torch.cuda.set_device(args.this_rank)
+        logging.info(f'rank:{args.this_rank}')
         logging.info(f'End up with cuda device {torch.rand(1).to(device=device)}')
         break
     except Exception as e:
         assert i != torch.cuda.device_count()-1, 'Can not find a feasible GPU'
 
-entire_train_data = None
-sample_size_dic = {}
-
+world_size = 0
+global_trainDB = None
+global_testDB = None
+last_model_tensors = []
+nextClientIds = None
+global_data_iter = {}
+global_client_profile = {}
+global_optimizers = {}
 sampledClientSet = set()
+
+# for malicious experiments only
+malicious_clients = set()
+flip_label_mapping = {}
+
+workers = [int(v) for v in str(args.learners).split('-')]
 
 os.environ['MASTER_ADDR'] = args.ps_ip
 os.environ['MASTER_PORT'] = args.ps_port
 os.environ['NCCL_DEBUG'] = 'INFO'
 
-def plot_acc(acc,args):
-    train_round = []
-    for i in range(0,args.epochs-1):
-        train_round.append(i)
-    plt.plot(train_round,acc,linewidth = 2.0, color = 'g')
-    plt.xlabel("train_round")
-    plt.ylabel("acc")
-    title = args.sample_mode + "__selection"
-    plt.title(title)
-    plt.savefig("./" + title)
-    plt.show()
-    print("plot success")
+logging.info("===== Experiment start =====")
 
-def test_img(net_g, data_loader):
-    net_g.eval()
-    test_loss = 0
-    correct = 0
-    
-    for idx, (data, target) in enumerate(data_loader):
-        data, target = data.cuda(), target.cuda()
-        log_probs = net_g(data)
-        test_loss += F.cross_entropy(log_probs, target, reduction='sum',ignore_index=-1).item()
-        y_pred = log_probs.data.max(1, keepdim=True)[1]
-        correct += y_pred.eq(target.data.view_as(y_pred)).long().cpu().sum()
+# =================== Label flipper ================ #
 
-    test_loss /= len(data_loader.dataset)
-    accuracy = 100.00 * correct / len(data_loader.dataset)
-    
-    return accuracy, test_loss
 
-def FedAvg(w):
-    w_avg = copy.deepcopy(w[0])
-    # print(w_avg.keys())
-    for k in w_avg.keys():
-        for i in range(1, len(w)):
-            w_avg[k] += w[i][k]
-        w_avg[k] = torch.div(w_avg[k], len(w))
-    return w_avg
+def generate_flip_mapping(num_of_labels, random_seed=0):
+    global flip_label_mapping
 
-class DatasetSplit(Dataset):
-    def __init__(self, dataset, idxs):
-        self.dataset = dataset
-        self.idxs = list(idxs)
+    from random import Random
 
-    def __len__(self):
-        return len(self.idxs)
+    rng = Random()
+    rng.seed(random_seed)
 
-    def __getitem__(self, item):
-        (images1, images2), labels = self.dataset[self.idxs[item]]
-        return (images1, images2), labels
+    label_mapping = list(range(num_of_labels))
+    rng.shuffle(label_mapping)
 
-def get_glob_train_dataset(dataset):
-    idxs = np.arange(len(dataset))
-    dict_users_labeled = set()
-    dict_users_labeled = set(np.random.choice(idxs, int(len(idxs) * 0.1), replace=False))
-    print("data set length",len(dict_users_labeled))
-    train_loader_labeled = torch.utils.data.DataLoader(
-            dataset=DatasetSplit(dataset, dict_users_labeled),
-            batch_size=10, 
-            shuffle=True, 
-            pin_memory=False, 
-            num_workers=2, 
-            drop_last=False, 
-            timeout=60
-        ) 
-    return train_loader_labeled
+    flip_label_mapping = {x: label_mapping[x] for x in range(num_of_labels)}
 
-def initiate_sampler_query(queue, numOfClients):
-    # Initiate the clientSampler
-    if args.sampler_path is None:
-        client_sampler = clientSampler(args.sample_mode, args.score_mode, args=args, filter=args.filter_less, sample_seed=args.sample_seed)
+    logging.info("====Flip label mapping is: \n{}".format(flip_label_mapping))
+
+def generate_malicious_clients(compromised_ratio, num_of_clients, random_seed=0):
+    global malicious_clients
+
+    from random import Random
+
+    rng = Random()
+    rng.seed(random_seed)
+
+    shuffled_client_ids = list(range(num_of_clients))
+    rng.shuffle(shuffled_client_ids)
+
+    trunc_len = int(compromised_ratio * num_of_clients)
+    malicious_clients = set(shuffled_client_ids[:trunc_len])
+
+    logging.info("====Malicious clients are: \n{}".format(malicious_clients))
+
+# =================== Report client information ================ #
+def report_data_info(rank, queue):
+    global nextClientIds, global_trainDB
+
+    client_div = global_trainDB.getDistance()
+    # report data information to the clientSampler master
+    queue.put({
+        rank: [client_div, global_trainDB.getSize()]
+    })
+
+    clientIdToRun = torch.zeros([world_size - 1], dtype=torch.int).to(device=device)
+    dist.broadcast(tensor=clientIdToRun, src=0)
+    nextClientIds = [clientIdToRun[args.this_rank - 1].item()]
+
+    if args.malicious_clients > 0:
+        generate_malicious_clients(args.malicious_clients, len(client_div))
+        generate_flip_mapping(args.num_class)
+
+def init_myprocesses(rank, size, model,
+                   q, param_q, stop_flag,
+                   fn, backend, client_cfg):
+    print("====Worker: init_myprocesses")
+    fn(rank, model, q, param_q, stop_flag, client_cfg)
+
+def scan_models(path):
+    files = os.listdir(path)
+    model_paths = {}
+
+    for file in files:
+        if not os.path.isdir(file):
+            if '.pth.tar' in file and args.model in file:
+                model_state_id = int(re.findall(args.model+"_(.+?).pth.tar", file)[0])
+                model_paths[model_state_id] = os.path.join(path, file)
+
+    return model_paths
+
+# ================== Scorer =================== #
+
+def collate(examples):
+    global tokenizer
+
+    if tokenizer._pad_token is None:
+        return (pad_sequence(examples, batch_first=True), None)
+    return (pad_sequence(examples, batch_first=True, padding_value=tokenizer.pad_token_id), None)
+
+def voice_collate_fn(batch):
+    def func(p):
+        return p[0].size(1)
+
+    start_time = time.time()
+
+    batch = sorted(batch, key=lambda sample: sample[0].size(1), reverse=True)
+    longest_sample = max(batch, key=func)[0]
+    freq_size = longest_sample.size(0)
+    minibatch_size = len(batch)
+    max_seqlength = longest_sample.size(1)
+    inputs = torch.zeros(minibatch_size, 1, freq_size, max_seqlength)
+    input_percentages = torch.FloatTensor(minibatch_size)
+    target_sizes = torch.IntTensor(minibatch_size)
+    targets = []
+    for x in range(minibatch_size):
+        sample = batch[x]
+        tensor = sample[0]
+        target = sample[1]
+        seq_length = tensor.size(1)
+        inputs[x][0].narrow(1, 0, seq_length).copy_(tensor)
+        input_percentages[x] = seq_length / float(max_seqlength)
+        target_sizes[x] = len(target)
+        targets.extend(target)
+    targets = torch.IntTensor(targets)
+
+    end_time = time.time()
+
+    return (inputs, targets, input_percentages, target_sizes), None
+
+# =================== simulating different clients =====================#
+
+def run_client(clientId, cmodel, iters, learning_rate, argdicts = {}):
+    global global_trainDB, global_data_iter, last_model_tensors, tokenizer
+    global malicious_clients, flip_label_mapping
+
+    # logging.info(f"Start to run client {clientId} ...")
+
+    curBatch = -1
+
+    if args.task != 'nlp' and args.task != 'text_clf':
+        optimizer = MySGD(cmodel.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4)
     else:
-        # load sampler
-        with open(args.sampler_path, 'rb') as loader:
-            client_sampler = pickle.load(loader)
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in cmodel.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": 5e-4,
+            },
+            {"params": [p for n, p in cmodel.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+        ]
+        # optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, eps=args.adam_epsilon, weight_decay=5e-4)
+        optimizer = MySGD(cmodel.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4)
 
-    # load client profiles
-    global_client_profile = {}
-    if os.path.exists(args.client_path):
-        with open(args.client_path, 'rb') as fin:
-            # {clientId: [computer, bandwidth]}
-            global_client_profile = pickle.load(fin)
-    # logging.info("=================client info================== {}".format(global_client_profile))
-    collectedClients = 0
-    initial_time = time.time()
-    clientId = 1
-    passed = False
-    num_client_profile = max(1, len(global_client_profile))
+    criterion = None
+    if args.task == 'voice':
+        criterion = None
+    else:
+        criterion = torch.nn.CrossEntropyLoss(reduction='none').to(device=device)
 
-    # In this simulation, we run data split on each worker, which amplifies the # of datasets
-    # Waiting for the data information from clients, or timeout
-    while collectedClients < numOfClients or (time.time() - initial_time) > 5000:
-        if not queue.empty():
-            tmp_dict = queue.get()
+    train_data_itr_list = []
+    collate_fn = None
 
-            # we only need to go over once
-            if not passed and args.sampler_path is None:
-                rank_src = list(tmp_dict.keys())[0]
-                distanceVec = tmp_dict[rank_src][0]
-                sizeVec = tmp_dict[rank_src][1]
+    if args.task == 'nlp':
+        collate_fn = collate
+    elif args.task == 'voice':
+        collate_fn = voice_collate_fn
 
-                for index, dis in enumerate(distanceVec):
-                    # since the worker rankId starts from 1, we also configure the initial dataId as 1
-                    mapped_id = max(1, clientId%num_client_profile)
-                    # systemProfileDict = global_client_profile[mapped_id] if mapped_id in global_client_profile else [1.0, 1.0]
-                    # print(systemProfile)
-                    systemProfile = []
-                    if mapped_id in global_client_profile:
-                        systemProfile.append(global_client_profile[mapped_id]['computation'])
-                        systemProfile.append(global_client_profile[mapped_id]['communication'])
-                    else:
-                        systemProfile = [1.0,1.0]
-                    print(systemProfile)
-                    client_sampler.registerClient(rank_src, clientId, dis, sizeVec[index], speed=systemProfile)
-                    client_sampler.registerDuration(clientId,
-                        batch_size=args.batch_size, upload_epoch=args.upload_epoch,
-                        model_size=args.model_size)
+    if clientId not in global_data_iter:
+        client_train_data = select_dataset(
+                                clientId, global_trainDB,
+                                batch_size=args.batch_size,
+                                collate_fn=collate_fn
+                            )
 
-                    clientId += 1
+        train_data_itr = iter(client_train_data)
+        total_batch_size = len(train_data_itr)
+        global_data_iter[clientId] = [train_data_itr, curBatch, total_batch_size, argdicts['iters']]
+    else:
+        [train_data_itr, curBatch, total_batch_size, epo] = global_data_iter[clientId]
 
-                passed = True
+    local_trained = 0
+    epoch_train_loss = None
+    comp_duration = 0.
+    norm_gradient = 0.
+    count = 0
 
-            collectedClients += 1
+    train_data_itr_list.append(train_data_itr)
+    run_start = time.time()
 
-    logging.info("====Info of all feasible clients {}".format(client_sampler.getDataInfo()))
+    numOfFailures = 0
+    numOfTries = 5
 
-    return client_sampler
+    input_sizes, target_sizes, output_sizes = None, None, None
+    masks = None
+    is_malicious = True if clientId in malicious_clients else False
 
-def init_myprocesses(rank, size, model,train_dataset,test_dataset, queue, param_q, stop_signal, fn, backend):
-    global sampledClientSet
-    dist.init_process_group(backend, init_method='env://',rank=rank, world_size=size)
+    cmodel = cmodel.to(device=device)
+    cmodel.train()
 
-    # After collecting all data information, then decide the clientId to run
-    workerRanks = [int(v) for v in str(args.learners).split('-')]
-    clientSampler = initiate_sampler_query(queue, len(workerRanks))
+    # TODO: if indeed enforce FedAvg, we will run fixed number of epochs, instead of iterations
+    for itr in range(iters):
+        it_start = time.time()
+        fetchSuccess = False
 
-    clientIdsToRun = []
-    for wrank in workerRanks:
-        nextClientIdToRun = clientSampler.nextClientIdToRun(hostId=wrank)
-        clientSampler.clientOnHost([nextClientIdToRun], wrank)
-        clientIdsToRun.append([nextClientIdToRun])
-        sampledClientSet.add(nextClientIdToRun)
-
-    clientTensor = torch.tensor(clientIdsToRun, dtype=torch.int, device=device)
-    logging.info(dist.broadcast(tensor=clientTensor, src=0))
-
-    # Start the PS service
-    logging.info(clientTensor)
-    fn(model,train_dataset,test_dataset, queue, param_q, stop_signal, clientSampler)
-
-def prune_client_tasks(clientSampler, sampledClientsRealTemp, numToRealRun, global_virtual_clock):
-
-    sampledClientsReal = []
-    # 1. remove dummy clients that are not available to the end of training
-    for virtualClient in sampledClientsRealTemp:
-        roundDuration = clientSampler.getCompletionTime(virtualClient,
-                                batch_size=args.batch_size, upload_epoch=args.upload_epoch,
-                                model_size=args.model_size) * args.clock_factor
-
-        if clientSampler.isClientActive(virtualClient, roundDuration + global_virtual_clock):
-            sampledClientsReal.append(virtualClient)
-
-    # 2. we decide to simulate the wall time and remove 1. stragglers 2. off-line
-    completionTimes = []
-    virtual_client_clock = {}
-    for virtualClient in sampledClientsReal:
-        roundDuration = clientSampler.getCompletionTime(virtualClient,
-                                batch_size=args.batch_size, upload_epoch=args.upload_epoch,
-                                model_size=args.model_size) * args.clock_factor
-        completionTimes.append(roundDuration)
-        virtual_client_clock[virtualClient] = roundDuration
-
-    # 3. get the top-k completions
-    sortedWorkersByCompletion = sorted(range(len(completionTimes)), key=lambda k:completionTimes[k])
-    top_k_index = sortedWorkersByCompletion[:numToRealRun]
-    clients_to_run = [sampledClientsReal[k] for k in top_k_index]
-
-    dummy_clients = [sampledClientsReal[k] for k in sortedWorkersByCompletion[numToRealRun:]]
-    round_duration = completionTimes[top_k_index[-1]]
-
-    return clients_to_run, dummy_clients, virtual_client_clock, round_duration
-
-def run(model,train_dataset,test_dataset, queue, param_q, stop_signal, clientSampler):
-    global logDir, sampledClientSet
-    # dataloader_kwargs = {
-    #     'batch_size': 30,
-    #     'drop_last': True,
-    #     'pin_memory': True,
-    #     'num_workers': 2,
-    # }
-    logging.info("====PS: get in run()")
-
-    dataloader_kwargs = {
-        'batch_size': 128,
-        'drop_last': True,
-        'pin_memory': False,
-        'num_workers': 2,
-    }
-    test_loader = torch.utils.data.DataLoader(
-                test_dataset,
-                shuffle=False,
-                **dataloader_kwargs
-            )
-    model = model.to(device=device)
-    model.train()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.5)
-    class_criterion = torch.nn.CrossEntropyLoss(size_average=False, ignore_index= -1 ) 
-    print("data set length: ",len(train_dataset))
-    # print("target number: ",train_dataset.targets.bincount().shape)
-    train_loader_labeled = get_glob_train_dataset(train_dataset)
-    for epoch in range(5):
-        for batch_idx, ((img, img_ema), label) in enumerate(train_loader_labeled):   
-            input_var = torch.autograd.Variable(img.cuda())
-            ema_input_var = torch.autograd.Variable(img_ema.cuda())
-            target_var = torch.autograd.Variable(label.cuda())                
-            minibatch_size = len(target_var)
-            labeled_minibatch_size = target_var.data.ne(-1).sum()      
-            model_out = model(input_var)
-            if isinstance(model_out, Variable):
-                logit1 = model_out
-            else:
-                assert len(model_out) == 2
-                logit1, logit2 = model_out          
-            class_logit, cons_logit = logit1, logit1
-            loss = class_criterion(class_logit, target_var) / minibatch_size
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            # if epoch == 18 :
-            #     pseudo_label1 = torch.softmax(model_out.detach_(), dim=-1)
-            #     max_probs, targets_u = torch.max(pseudo_label1, dim=-1)
-            #     print("max_probs: ",max_probs)
-        print("epoch: ",epoch)
-    # model.eval()
-    # model.eval()
-    # acc, loss_train_test_labeled = test_img(model, test_loader)
-    # print("acc",str(acc))
-    # model.train()
-    #if not args.load_model:
-    for name, param in model.named_parameters():
-        dist.broadcast(tensor=param.data.to(device=device), src=0)
-        #logging.info(f"====Model parameters name: {name}")
-
-    workers = [int(v) for v in str(args.learners).split('-')]
-    acc_list = []
-    epoch_train_loss = 0
-    data_size_epoch = 0   # len(train_data), one epoch
-    epoch_count = 1
-    global_virtual_clock = 0.
-    round_duration = 0.
-
-    staleness = 0
-    learner_staleness = {l: 0 for l in workers}
-    learner_local_step = {l: 0 for l in workers}
-    learner_cache_step = {l: 0 for l in workers}
-    pendingWorkers = {}
-    test_results = {}
-    virtualClientClock = {}
-    exploredPendingWorkers = []
-    avgUtilLastEpoch = 0.
-
-    s_time = time.time()
-    epoch_time = s_time
-
-    global_update = 0
-    received_updates = 0
-    accuracy = []
-    clientsLastEpoch = []
-    sumDeltaWeights = []
-    clientWeightsCache = {}
-    last_sampled_clients = None
-    last_model_parameters = [torch.clone(p.data) for p in model.parameters()]
-
-    # random component to generate noise
-    median_reward = 1.
-
-    gradient_controller = None
-    # initiate yogi if necessary
-    if args.gradient_policy == 'yogi':
-        gradient_controller = YoGi(eta=args.yogi_eta, tau=args.yogi_tau, beta=args.yogi_beta, beta2=args.yogi_beta2)
-
-    clientInfoFile = logDir + 'clientInfoFile'
-    # dump the client info
-    with open(clientInfoFile, 'wb') as fout:
-        pickle.dump(clientSampler.getClientsInfo(), fout)
-
-    training_history = {'data_set': args.data_set,
-                        'model': args.model,
-                        'sample_mode': args.sample_mode,
-                        'gradient_policy': args.gradient_policy,
-                        'task': args.task,
-                        'perf': collections.OrderedDict()}
-    logging.info(training_history)
-    while True:
-        #labeled data training on server
-
-        if not queue.empty():
+        while not fetchSuccess and numOfFailures < numOfTries:
             try:
-                handle_start = time.time()
-                tmp_dict = queue.get()
-                rank_src = list(tmp_dict.keys())[0]
+                try:
+                    if args.task == 'nlp':
+                        # target is None in this case
+                        (data, _) = next(train_data_itr_list[0])
+                        data, target = mask_tokens(data, tokenizer, args) if args.mlm else (data, data)
+                    elif args.task == 'text_clf':
+                        (data, masks), target = next(train_data_itr_list[0])
+                        masks = Variable(masks).to(device=device)
+                    elif args.task == 'voice':
+                        (data, target, input_percentages, target_sizes), _ = next(train_data_itr_list[0])
+                        input_sizes = input_percentages.mul_(int(data.size(3))).int()
+                    else:
+                        ((data,ema_data), target) = next(train_data_itr_list[0])
 
-                [iteration_loss, trained_size, isWorkerEnd, clientIds, speed, testRes, virtualClock] = \
-                [tmp_dict[rank_src][i] for i in range(1, len(tmp_dict[rank_src]))]
-                #clientSampler.registerSpeed(rank_src, clientId, speed)
-                # print(iteration_loss)
-                if isWorkerEnd:
-                    logging.info("====Worker {} has completed all its data computation!".format(rank_src))
-                    learner_staleness.pop(rank_src)
-                    if (len(learner_staleness) == 0):
-                        stop_signal.put(1)
-                        break
-                    continue
+                    fetchSuccess = True
+                except Exception as ex:
+                    try:
+                        if args.num_loaders > 0:
+                            train_data_itr_list[0]._shutdown_workers()
+                            del train_data_itr_list[0]
+                    except Exception as e:
+                        logging.info("====Error {}".format(str(e)))
 
-                learner_local_step[rank_src] += 1
+                    tempData = select_dataset(
+                            clientId, global_trainDB,
+                            batch_size=args.batch_size,
+                            collate_fn=collate_fn
+                        )
 
-                handlerStart = time.time()
-                delta_wss = tmp_dict[rank_src][0]
-                clientsLastEpoch += clientIds
-                ratioSample = 0
-
-                logging.info("====Start to merge models")
-
-                if not args.test_only or epoch_count == 1:
-                    for i, clientId in enumerate(clientIds):
-                        gradients = None
-                        ranSamples = float(speed[i].split('_')[1])
-
-                        data_size_epoch += trained_size[i]
-
-                        # fraction of total samples on this specific node
-                        ratioSample = clientSampler.getSampleRatio(clientId, rank_src, args.is_even_avg)
-                        delta_ws = delta_wss[i]
-                        #clientWeightsCache[clientId] = [torch.from_numpy(x).to(device=device) for x in delta_ws]
-
-                        epoch_train_loss += ratioSample * iteration_loss[i]
-                        isSelected = True if clientId in sampledClientSet else False
-
-                        gradient_l2_norm = 0
-
-                        # apply the update into the global model if the client is involved
-                        for idx, param in enumerate(model.parameters()):
-                            model_weight = torch.from_numpy(delta_ws[idx]).to(device=device)
-
-                            # model_weight is the delta of last model
-                            if isSelected:
-                                # the first received client
-                                if received_updates == 0:
-                                    sumDeltaWeights.append(model_weight * ratioSample)
-                                else:
-                                    sumDeltaWeights[idx] += model_weight * ratioSample
-
-                            gradient_l2_norm += ((model_weight-last_model_parameters[idx]).norm(2)**2).item()
-
-                        # bias term for global speed
-                        virtual_c = virtualClientClock[clientId] if clientId in virtualClientClock else 1.
-                        clientUtility = 1.
-                        size_of_sample_bin = 1.
-
-                        if args.capacity_bin == True:
-                            size_of_sample_bin = min(clientSampler.getClient(clientId).size, args.upload_epoch*args.batch_size)
-
-                        # register the score
-                        clientUtility = math.sqrt(iteration_loss[i]) * size_of_sample_bin
-
-                        # add noise to the utility
-                        if args.noise_factor > 0:
-                            noise = np.random.normal(0, args.noise_factor * median_reward, 1)[0]
-                            clientUtility += noise
-                            clientUtility = max(1e-2, clientUtility)
-
-                        clientSampler.registerScore(clientId, clientUtility, auxi=math.sqrt(iteration_loss[i]),
-                                                    time_stamp=epoch_count, duration=virtual_c
-                                      )
-                        if isSelected:
-                            received_updates += 1
-
-                        avgUtilLastEpoch += ratioSample * clientUtility
-
-                logging.info("====Done handling rank {}, with ratio {}, now collected {} clients".format(rank_src, ratioSample, received_updates))
-
-                # aggregate the test results
-                updateEpoch = testRes[-1]
-                if updateEpoch not in test_results:
-                    # [top_1, top_5, loss, total_size, # of collected ranks]
-                    test_results[updateEpoch] = [0., 0., 0., 0., 0]
-
-                if updateEpoch != -1:
-                    for idx, c in enumerate(testRes[:-1]):
-                        test_results[updateEpoch][idx] += c
-
-                    test_results[updateEpoch][-1] += 1
-                    # have collected all ranks
-                    if test_results[updateEpoch][-1] == len(workers):
-                        top_1_str = 'top_1: '
-                        top_5_str = 'top_5: '
-
-                        try:
-                            logging.info("====After aggregation in epoch: {}, virtual_clock: {}, {}: {} % ({}), {}: {} % ({}), test loss: {}, test len: {}"
-                                    .format(updateEpoch, global_virtual_clock, top_1_str, round(test_results[updateEpoch][0]/test_results[updateEpoch][3]*100.0, 4),
-                                    test_results[updateEpoch][0], top_5_str, round(test_results[updateEpoch][1]/test_results[updateEpoch][3]*100.0, 4),
-                                    test_results[updateEpoch][1], test_results[updateEpoch][2]/test_results[updateEpoch][3], test_results[updateEpoch][3]))
-                            training_history['perf'][updateEpoch] = {'round': updateEpoch, 'clock': global_virtual_clock,
-                                top_1_str: round(test_results[updateEpoch][0]/test_results[updateEpoch][3]*100.0, 4),
-                                top_5_str: round(test_results[updateEpoch][1]/test_results[updateEpoch][3]*100.0, 4),
-                                'loss': test_results[updateEpoch][2]/test_results[updateEpoch][3],
-                                }
-
-                            with open(os.path.join(logDir, 'training_perf'), 'wb') as fout:
-                                pickle.dump(training_history, fout)
-
-                        except Exception as e:
-                            logging.info(f"====Error {e}")
-
-                handlerDur = time.time() - handlerStart
-                global_update += 1
-
-                # get the current minimum local staleness_sum_epoch
-                currentMinStep = min([learner_local_step[key] for key in learner_local_step.keys()])
-
-                staleness += 1
-                learner_staleness[rank_src] = staleness
-
-                # if the worker is within the staleness, then continue w/ local cache and do nothing
-                # Otherwise, block it
-                if learner_local_step[rank_src] >= args.stale_threshold + currentMinStep:
-                    pendingWorkers[rank_src] = learner_local_step[rank_src]
-                    # lock the worker
-                    logging.info("Lock worker " + str(rank_src) + " with localStep " + str(pendingWorkers[rank_src]) +
-                                            " , while globalStep is " + str(currentMinStep) + "\n")
-
-                # if the local cache is too stale, then update it
-                elif learner_cache_step[rank_src] < learner_local_step[rank_src] - args.stale_threshold:
-                    pendingWorkers[rank_src] = learner_local_step[rank_src]
-
-                # release all pending requests, if the staleness does not exceed the staleness threshold in SSP
-                handle_dur = time.time() - handle_start
-
-                workersToSend = []
-
-                for pworker in pendingWorkers.keys():
-                    # check its staleness
-                    if pendingWorkers[pworker] <= args.stale_threshold + currentMinStep:
-                        # start to send param, to avoid synchronization problem, first create a copy here?
-                        workersToSend.append(pworker)
-
-                del delta_wss, tmp_dict
-
-                if len(workersToSend) > 0:
-                    # assign avg reward to explored, but not ran workers
-                    for clientId in exploredPendingWorkers:
-                        clientSampler.registerScore(clientId, avgUtilLastEpoch,
-                                                time_stamp=epoch_count, duration=virtualClientClock[clientId],
-                                                success=False
-                                  )
-
-                    workersToSend = sorted(workersToSend)
-                    epoch_count += 1
-                    avgUtilLastEpoch = 0.
-
-                    logging.info("====Epoch {} completes {} clients with loss {}, sampled rewards are: \n {} \n=========="
-                                .format(epoch_count, len(clientsLastEpoch), epoch_train_loss, {x:clientSampler.getScore(0, x) for x in sorted(clientsLastEpoch)}))
-
-                    epoch_train_loss = 0.
-                    clientsLastEpoch = []
-                    send_start = time.time()
-
-                    # resampling the clients if necessary
-                    if epoch_count % args.resampling_interval == 0 or epoch_count == 2:
-                        logging.info("====Start to sample for epoch {}, global virtualClock: {}, round_duration: {}"
-                                        .format(epoch_count, global_virtual_clock, round_duration))
-
-
-                        numToSample = int(args.total_worker * args.overcommit)
-
-                        if args.fixed_clients and last_sampled_clients:
-                            print("Not oort")
-                            sampledClientsRealTemp = last_sampled_clients
-                        else:
-                            print("oort")
-                            sampledClientsRealTemp = sorted(clientSampler.resampleClients(numToSample, cur_time=epoch_count))
-
-                        last_sampled_clients = sampledClientsRealTemp
-
-                        # remove dummy clients that we are not going to run
-                        clientsToRun, exploredPendingWorkers, virtualClientClock, round_duration = prune_client_tasks(
-                                                            clientSampler, sampledClientsRealTemp,
-                                                            args.total_worker, global_virtual_clock
-                                                        )
-                        sampledClientSet = set(clientsToRun)
-
-                        logging.info("====Try to resample clients, final takes: \n {}"
-                                    .format(clientsToRun, ))#virtualClientClock))
-
-                        allocateClientToWorker = {}
-                        allocateClientDict = {rank:0 for rank in workers}
-
-                        # for those device lakes < # of clients, we use round-bin for load balance
-                        for c in clientsToRun:
-                            clientDataSize = clientSampler.getClientSize(c)
-                            numOfBatches = int(math.ceil(clientDataSize/args.batch_size))
-
-                            if numOfBatches > args.upload_epoch:
-                                workerId = workers[(c-1)%len(workers)]
-                            else:
-                                # pick the one w/ the least load
-                                workerId = sorted(allocateClientDict, key=allocateClientDict.get)[0]
-
-                            if workerId not in allocateClientToWorker:
-                                allocateClientToWorker[workerId] = []
-
-                            allocateClientToWorker[workerId].append(c)
-                            allocateClientDict[workerId] = allocateClientDict[workerId] + 1
-
-                        for w in allocateClientToWorker.keys():
-                            clientSampler.clientOnHost(allocateClientToWorker[w], w)
-
-                    clientIdsToRun = [currentMinStep]
-                    clientsList = []
-
-                    endIdx = 0
-
-                    for worker in workers:
-                        learner_cache_step[worker] = currentMinStep
-                        endIdx += clientSampler.getClientLenOnHost(worker)
-                        clientIdsToRun.append(endIdx)
-                        clientsList += clientSampler.getCurrentClientIds(worker)
-                        # remove from the pending workers
-                        del pendingWorkers[worker]
-
-                   # transformation of gradients if necessary
-                    if gradient_controller is not None:
-                        # sumDeltaWeights = FedAvg(sumDeltaWeights)
-                        sumDeltaWeights = gradient_controller.update(sumDeltaWeights)
-
-                    for idx, param in enumerate(model.parameters()):
-                        if not args.test_only:
-                            param.data += sumDeltaWeights[idx]
-                        # dist.broadcast(tensor=(param.data.to(device=device)), src=0)
-                    model.train()
-                    for batch_idx, ((img, img_ema), label) in enumerate(train_loader_labeled):   
-                        input_var = torch.autograd.Variable(img.cuda())
-                        ema_input_var = torch.autograd.Variable(img_ema.cuda())
-                        target_var = torch.autograd.Variable(label.cuda())                
-                        minibatch_size = len(target_var)
-                        labeled_minibatch_size = target_var.data.ne(-1).sum()    
-                        ema_model_out = model(ema_input_var)
-                        model_out = model(input_var)
-                        if isinstance(model_out, Variable):
-                            logit1 = model_out
-                            ema_logit = ema_model_out
-                        else:
-                            assert len(model_out) == 2
-                            assert len(ema_model_out) == 2
-                            logit1, logit2 = model_out
-                            ema_logit, _ = ema_model_out    
-                                    
-                        class_logit, cons_logit = logit1, logit1
-                        class_loss = class_criterion(class_logit, target_var) / minibatch_size
-                        loss = class_loss
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
-                    model.eval()
-                    acc, loss_train_test_labeled = test_img(model, test_loader)
-                    acc_list.append(acc)
-                    print("acc",str(acc))
-                    f = open("/data/yuning_/Oort/training/acc.txt",'w')
-                    f.write(str(acc))
-                    f.write("\n")
-                    # f.read()
-                    f.close()
-                    model.eval()   
-                    for idx, param in enumerate(model.parameters()):
-                        dist.broadcast(tensor=(param.data.to(device=device)), src=0)
-                    dist.broadcast(tensor=torch.tensor(clientIdsToRun, dtype=torch.int).to(device=device), src=0)
-                    dist.broadcast(tensor=torch.tensor(clientsList, dtype=torch.int).to(device=device), src=0)
-                    last_model_parameters = [torch.clone(p.data) for p in model.parameters()]
-
-                    if global_update % args.display_step == 0:
-                        logging.info("Handle Wight {} | Send {}".format(handle_dur, time.time() - send_start))
-
-                    # update the virtual clock
-                    global_virtual_clock += round_duration
-                    received_updates = 0
-
-                    sumDeltaWeights = []
-                    clientWeightsCache = {}
-
-                    if args.noise_factor > 0:
-                        median_reward = clientSampler.get_median_reward()
-                        logging.info('For epoch: {}, median_reward: {}, dev: {}'
-                                        .format(epoch_count, median_reward, median_reward*args.noise_factor))
-
-                    gc.collect()
-
-                # The training stop
-                if(epoch_count >= args.epochs):
-                    plot_acc(acc_list,args)
-                    stop_signal.put(1)
-                    logging.info('Epoch is done: {}'.format(epoch_count))
-                    break
+                    #logging.info(f"====Error {str(ex)}")
+                    train_data_itr_list = [iter(tempData)]
 
             except Exception as e:
+                numOfFailures += 1
                 exc_type, exc_obj, exc_tb = sys.exc_info()
                 fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-                print("====Error: " + str(e) + '\n')
                 logging.info("====Error: {}, {}, {}, {}".format(e, exc_type, fname, exc_tb.tb_lineno))
+                time.sleep(0.5)
 
-        e_time = time.time()
-        if (e_time - s_time) >= float(args.timeout):
-            stop_signal.put(1)
-            print('Time up: {}, Stop Now!'.format(e_time - s_time))
+        if numOfFailures >= numOfTries:
             break
+
+        numOfFailures = 0
+        curBatch = curBatch + 1
+
+        # flip the label if the client is malicious
+        if is_malicious:
+            for idx, x in enumerate(target):
+                target[idx] = flip_label_mapping[int(x.item())]
+
+        data = torch.autograd.Variable(data).to(device=device)
+        ema_data = torch.autograd.Variable(ema_data).to(device=device)
+        target = torch.autograd.Variable(target).to(device=device)
+
+        if args.task != 'voice':
+            target = Variable(target).to(device=device)
+        if args.task == 'speech':
+            data = torch.unsqueeze(data, 1)
+
+        local_trained += len(target)
+
+        comp_start = time.time()
+
+        if args.task == 'nlp':
+            outputs = cmodel(data, masked_lm_labels=target) if args.mlm else cmodel(data, labels=target)
+            loss = outputs[0]
+            #torch.nn.utils.clip_grad_norm_(cmodel.parameters(), args.max_grad_norm)
+        elif args.task == 'text_clf':
+            loss, logits = cmodel(data, token_type_ids=None, attention_mask=masks, labels=target)
+            #loss = criterion(output, target)
+        elif args.task == 'voice':
+            outputs, output_sizes = cmodel(data, input_sizes)
+            outputs = outputs.transpose(0, 1).float()  # TxNxH
+            loss = criterion(outputs, target, output_sizes, target_sizes).to(device=device)
+        else:
+            output = cmodel(data)
+            ema_output = cmodel(ema_data)
+            # minibatch_size = len(target)
+            # labeled_minibatch_size = target.data.ne(-1).sum()
+            if isinstance(output, Variable):
+                logit1 = output
+                ema_logit = ema_output
+            else:
+                assert len(output) == 2
+                assert len(ema_output) == 2
+                logit1, logit2 = output
+                ema_logit, _ = output
+
+            class_logit, cons_logit = logit1, logit1
+            pseudo_label1 = torch.softmax(output.detach_(), dim=-1)
+            max_probs, targets_u = torch.max(pseudo_label1, dim=-1)
+            mask = max_probs.ge(0.95).float()
+            # print(mask)
+            loss = criterion(ema_logit, targets_u)*mask
+        temp_loss = 0.
+        loss_cnt = 1.
+
+        loss_list = loss.tolist() if args.task != 'nlp' else [loss.item()]
+        for l in loss_list:
+            temp_loss += l**2
+
+        loss_cnt = len(loss_list)
+
+        temp_loss = temp_loss/float(loss_cnt)
+        # only measure the loss of the first epoch
+        if itr < total_batch_size:# >= (iters - total_batch_size - 1):
+            if epoch_train_loss is None:
+                epoch_train_loss = temp_loss
+            else:
+                epoch_train_loss = (1. - args.loss_decay) * epoch_train_loss + args.loss_decay * temp_loss
+
+        count += len(target)
+
+        # ========= Define the backward loss ==============
+        optimizer.zero_grad()
+        loss.mean().backward()
+        if args.task != 'nlp' and args.task != 'text_clf':
+            delta_w = optimizer.get_delta_w(learning_rate)
+
+            if not args.proxy_avg:
+                for idx, param in enumerate(cmodel.parameters()):
+                    param.data -= delta_w[idx].to(device=device)
+            else:
+                for idx, param in enumerate(cmodel.parameters()):
+                    param.data -= delta_w[idx].to(device=device)
+                    param.data += learning_rate * args.proxy_mu * (last_model_tensors[idx] - param.data)
+        else:
+            # proxy term
+            optimizer.step()
+
+            if args.proxy_avg:
+                for idx, param in enumerate(cmodel.parameters()):
+                    param.data += learning_rate * args.proxy_mu * (last_model_tensors[idx] - param.data)
+
+            cmodel.zero_grad()
+
+        comp_duration = (time.time() - comp_start)
+
+        # logging.info('For client {}, upload iter {}, epoch {}, Batch {}/{}, Loss:{} | TotalTime: {} | CompTime: {} | DataLoader: {} | epoch_train_loss: {} | malicious: {}\n'
+        #            .format(clientId, argdicts['iters'], int(curBatch/total_batch_size),
+        #            (curBatch % total_batch_size), total_batch_size, temp_loss,
+        #            round(time.time() - it_start, 4), round(comp_duration, 4), round(comp_start - it_start, 4), epoch_train_loss, is_malicious))
+
+    # remove the one with LRU
+    if len(global_client_profile) > args.max_iter_store:
+        allClients = global_data_iter.keys()
+        rmClient = sorted(allClients, key=lambda k:global_data_iter[k][3])[0]
+
+        del global_data_iter[rmClient]
+
+    # save the state of this client if # of batches > iters, since we want to pass over all samples at least one time
+    if total_batch_size > iters * 10 and len(train_data_itr_list) > 0 and not args.release_cache:
+        global_data_iter[clientId] = [train_data_itr_list[0], curBatch, total_batch_size, argdicts['iters']]
+    else:
+        if args.num_loaders > 0:
+            for loader in train_data_itr_list:
+                try:
+                    loader._shutdown_workers()
+                except Exception as e:
+                    pass
+        del train_data_itr_list
+        del global_data_iter[clientId]
+
+    # we only transfer the delta_weight
+    model_param = [(param.data - last_model_tensors[idx]).cpu().numpy() for idx, param in enumerate(cmodel.parameters())]
+
+    time_spent = time.time() - run_start
+
+    # add bias to the virtual clock, computation x (# of trained samples) + communication
+    if clientId in global_client_profile:
+        time_cost = global_client_profile[clientId][0] * count + global_client_profile[clientId][1]
+    else:
+        # print("no global_client_profile")
+        time_cost = time_spent
+
+    speed = 0
+    isSuccess = True
+    if count > 0:
+        speed = time_spent/float(count)
+    else:
+        isSuccess = False
+        logging.info("====Failed to run client {}".format(clientId))
+
+    # logging.info(f"Completed to run client {clientId}")
+
+    #logging.info("====Epoch epoch_train_loss is {}".format(epoch_train_loss))
+    return model_param, epoch_train_loss, local_trained, str(speed) + '_' + str(count), time_cost, isSuccess
+
+def run(rank, model, queue, param_q, stop_flag, client_cfg):
+    logging.info("====Worker: Start running")
+
+    global nextClientIds, global_trainDB, global_testDB, last_model_tensors
+    criterion = None
+
+    if args.task == 'voice':
+        criterion = None
+    else:
+        criterion = torch.nn.CrossEntropyLoss().to(device=device)
+
+    startTime = time.time()
+
+    # Fetch the initial parameters from the server side (we called it parameter_server)
+    last_model_tensors = []
+    #model.train()
+    model = model.to(device=device)
+
+    for idx, param in enumerate(model.parameters()):
+        dist.broadcast(tensor=param.data, src=0)
+
+    if args.load_model:
+        try:
+            with open(modelPath, 'rb') as fin:
+                model = pickle.load(fin)
+
+            model = model.to(device=device)
+            #model.load_state_dict(torch.load(modelPath, map_location=lambda storage, loc: storage.cuda(deviceId)))
+            logging.info("====Load model successfully\n")
+        except Exception as e:
+            logging.info("====Error: Failed to load model due to {}\n".format(str(e)))
+            sys.exit(-1)
+
+    for idx, param in enumerate(model.parameters()):
+        last_model_tensors.append(copy.deepcopy(param.data))
+
+    print('Begin!')
+    logging.info('\n' + repr(args) + '\n')
+
+    learning_rate = args.learning_rate
+
+    testResults = [0, 0, 0, 1]
+    # first run a forward pass
+    # test_loss, acc, acc_5, testResults = test_model(rank, model, test_data, criterion=criterion, tokenizer=tokenizer)
+    uploadEpoch = 0
+    models_dir = None
+    sorted_models_dir = None
+    isComplete = False
+
+    collate_fn = None
+
+    if args.task == 'nlp':
+        collate_fn = collate
+    elif args.task == 'voice':
+        collate_fn = voice_collate_fn
+
+    last_test = time.time()
+
+    if args.read_models_path:
+        models_dir = scan_models(args.model_path)
+        sorted_models_dir = sorted(models_dir)
+
+    tempModelPath = logDir+'/model_'+str(args.this_rank)+'.pth.tar'
+
+    for epoch in range(1, int(args.epochs) + 1):
+        try:
+            if epoch % args.decay_epoch == 0:
+                learning_rate = max(args.min_learning_rate, learning_rate * args.decay_factor)
+
+            trainedModels = []
+            preTrainedLoss = []
+            trainedSize = []
+            trainSpeed = []
+            virtualClock = []
+            ranClients = []
+
+            computeStart = time.time()
+
+            if not args.test_only:
+                # dump a copy of model
+                with open(tempModelPath, 'wb') as fout:
+                    pickle.dump(model, fout)
+
+                for idx, nextClientId in enumerate(nextClientIds):
+                    # roll back to the global model for simulation
+                    with open(tempModelPath, 'rb') as fin:
+                        model = pickle.load(fin)
+
+                    _model_param, _loss, _trained_size, _speed, _time, _isSuccess = run_client(
+                                clientId=nextClientId,
+                                cmodel=model,
+                                learning_rate=learning_rate,
+                                iters=args.upload_epoch,
+                                argdicts={'iters': epoch}
+                            )
+                    # logging.info('==== id {} loss {}'.format(idx,_loss))
+                    if _isSuccess is False:
+                        print("failed")
+                        continue
+
+                    score = -1
+                    if args.forward_pass:
+                        forward_dataset = select_dataset(nextClientId, global_trainDB, batch_size=args.test_bsz, isTest=True)
+                        forward_loss = run_forward_pass(model, forward_dataset)
+                        score = forward_loss
+
+                    trainedModels.append(_model_param)
+                    preTrainedLoss.append(_loss if score == -1 else score)
+                    trainedSize.append(_trained_size)
+                    trainSpeed.append(_speed)
+                    virtualClock.append(_time)
+                    ranClients.append(nextClientId)
+
+                #gc.collect()
+            else:
+                logging.info('====Start test round {}'.format(epoch))
+
+                model_load_path = None
+                # force to read models
+                if models_dir is not None:
+                    model_load_path = models_dir[sorted_models_dir[0]]
+
+                    with open(model_load_path, 'rb') as fin:
+                        model = pickle.load(fin)
+                        model = model.to(device=device)
+
+                    logging.info(f"====Now load model checkpoint: {sorted_models_dir[0]}")
+
+                    del sorted_models_dir[0]
+
+                    if len(sorted_models_dir) == 0:
+                        isComplete = True
+
+                testResults = [0., 0., 0., 1.]
+                # designed for testing only
+                for nextClientId in nextClientIds:
+
+                    client_dataset = select_dataset(nextClientId, global_trainDB, batch_size=args.test_bsz, isTest=True,
+                                                        fractional=False, collate_fn=collate_fn
+                                                    )
+                    test_loss, acc, acc_5, temp_testResults = test_model(rank, model, client_dataset, criterion=criterion, tokenizer=tokenizer)
+
+                    logging.info(f'====Epoch: {epoch}, clientId: {nextClientId}, len: {temp_testResults[-1]}, test_loss: {test_loss}, acc: {acc}, acc_5: {acc_5}')
+
+                    # merge test results
+                    for idx, item in enumerate(temp_testResults):
+                        testResults[idx] += item
+
+                uploadEpoch = epoch
+
+            computeEnd = time.time() - computeStart
+
+            # upload the weight
+            sendStart = time.time()
+            testResults.append(uploadEpoch)
+            queue.put({rank: [trainedModels, preTrainedLoss, trainedSize, isComplete, ranClients, trainSpeed, testResults, virtualClock]})
+            uploadEpoch = -1
+            sendDur = time.time() - sendStart
+
+            logging.info("====Pushing takes {} s".format(sendDur))
+            # wait for new models
+            receStart = time.time()
+
+            last_model_tensors = []
+            for idx, param in enumerate(model.parameters()):
+                tmp_tensor = torch.zeros_like(param.data)
+                dist.broadcast(tensor=tmp_tensor, src=0)
+                param.data = tmp_tensor
+                last_model_tensors.append(copy.deepcopy(tmp_tensor))
+
+            # receive current minimum step, and the clientIdLen for next training
+            step_tensor = torch.zeros([world_size], dtype=torch.int).to(device=device)
+            dist.broadcast(tensor=step_tensor, src=0)
+            globalMinStep = step_tensor[0].item()
+            totalLen = step_tensor[-1].item()
+            endIdx = step_tensor[args.this_rank].item()
+            startIdx = 0 if args.this_rank == 1 else step_tensor[args.this_rank - 1].item()
+
+            clients_tensor = torch.zeros([totalLen], dtype=torch.int).to(device=device)
+            dist.broadcast(tensor=clients_tensor, src=0)
+            nextClientIds = [clients_tensor[x].item() for x in range(startIdx, endIdx)]
+
+            receDur = time.time() - receStart
+
+            #logging.info("====Finish receiving ps")
+            evalStart = time.time()
+            # test the model if necessary
+            if epoch % int(args.eval_interval) == 0:
+                model = model.to(device=device)
+                # forward pass of the training data
+                if args.test_train_data:
+                    rank_train_data = select_dataset(
+                                        args.this_rank, global_trainDB, batch_size=args.test_bsz, is_rank=rank,
+                                        collate_fn=collate_fn
+                                      )
+                    test_loss, acc, acc_5, testResults = test_model(rank, model, rank_train_data, criterion=criterion, tokenizer=tokenizer)
+                else:
+                    test_loss, acc, acc_5, testResults = test_model(rank, model, global_testDB, criterion=criterion, tokenizer=tokenizer)
+
+                logging.info("After aggregation epoch {}, CumulTime {}, eval_time {}, test_loss {}, test_accuracy {}, test_5_accuracy {} \n"
+                            .format(epoch, round(time.time() - startTime, 4), round(time.time() - evalStart, 4), test_loss, acc, acc_5))
+
+                uploadEpoch = epoch
+                last_test = time.time()
+                gc.collect()
+
+            if epoch % args.dump_epoch == 0 and args.this_rank == 1:
+                model = model.to(device='cpu')
+                with open(logDir+'/'+str(args.model)+'_'+str(epoch)+'.pth.tar', 'wb') as fout:
+                    pickle.dump(model, fout)
+
+                logging.info("====Dump model successfully")
+                model = model.to(device=device)
+
+        except Exception as e:
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+            logging.info("====Error: {}, {}, {}, {}".format(e, exc_type, fname, exc_tb.tb_lineno))
+            break
+
+        if stop_flag.value:
+            break
+
+    queue.put({rank: [None, None, None, True, -1, -1]})
+    logging.info("Worker {} has completed epoch {}!".format(args.this_rank, epoch))
 
 def setup_seed(seed):
      torch.manual_seed(seed)
@@ -647,27 +644,20 @@ def setup_seed(seed):
      random.seed(seed)
      torch.backends.cudnn.deterministic = True
 
-# communication channel for client information
 def initiate_channel():
-
-    queue = Queue()
-    param = Queue()
-    stop_or_not = Queue()
-
-    BaseManager.register('get_queue', callable=lambda: queue)
-    BaseManager.register('get_param', callable=lambda: param)
-    BaseManager.register('get_stop_signal', callable=lambda: stop_or_not)
+    BaseManager.register('get_queue')
+    BaseManager.register('get_param')
+    BaseManager.register('get_stop_signal')
     manager = BaseManager(address=(args.ps_ip, args.manager_port), authkey=b'queue')
 
     return manager
 
 if __name__ == "__main__":
-
-    # Control the global random
+    #global global_trainDB, global_testDB
     setup_seed(args.this_rank)
 
     manager = initiate_channel()
-    manager.start()
+    manager.connect()
 
     q = manager.get_queue()  # queue for parameter_server signal process
     param_q = manager.get_param()  # init
@@ -675,12 +665,63 @@ if __name__ == "__main__":
 
     logging.info("====Start to initialize dataset")
 
+    gc.disable()
     model, train_dataset, test_dataset = init_dataset()
-    world_size = len(str(args.learners).split('-')) + 1
+    gc.enable()
+    gc.collect()
+
+    splitTrainRatio = []
+    client_cfg = {}
+
+    # Initialize PS - client communication channel
+    world_size = len(workers) + 1
     this_rank = args.this_rank
-    print(this_rank)
-    init_myprocesses(this_rank, world_size, model,train_dataset,test_dataset,
-                    q, param_q, stop_signal, run, args.backend
-                )
-    logging.info("stop")
-    manager.shutdown()
+    dist.init_process_group(args.backend, init_method='env://',rank=this_rank, world_size=world_size)
+
+    # Split the dataset
+    # total_worker != 0 indicates we create more virtual clients for simulation
+    if args.total_worker > 0 and args.duplicate_data == 1:
+        workers = [i for i in range(1, args.total_worker + 1)]
+
+    # load data partitioner (entire_train_data)
+    dataConf = os.path.join(args.data_dir, 'sampleConf') if args.data_set == 'imagenet' else None
+
+    logging.info("==== Starting training data partitioner =====")
+    global_trainDB = DataPartitioner(data=train_dataset, splitConfFile=dataConf,
+                        numOfClass=args.num_class, dataMapFile=args.data_mapfile)
+    logging.info("==== Finished training data partitioner =====")
+
+    dataDistribution = [int(x) for x in args.sequential.split('-')]
+    distributionParam = [float(x) for x in args.zipf_alpha.split('-')]
+
+    for i in range(args.duplicate_data):
+        partition_dataset(global_trainDB, workers, splitTrainRatio, dataDistribution[i],
+                                    filter_class=args.filter_class, arg = {'balanced_client':0, 'param': distributionParam[i]})
+    global_trainDB.log_selection()
+
+    report_data_info(this_rank, q)
+    splitTestRatio = []
+
+    logging.info("==== Starting testing data partitioner =====")
+    testsetPartitioner = DataPartitioner(data=test_dataset, isTest=True, numOfClass=args.num_class)
+    logging.info("==== Finished testing data partitioner =====")
+
+    collate_fn = None
+
+    if args.task == 'nlp':
+        collate_fn = collate
+    elif args.task == 'voice':
+        collate_fn = voice_collate_fn
+
+    partition_dataset(testsetPartitioner, [i for i in range(world_size-1)], splitTestRatio)
+    global_testDB = select_dataset(this_rank, testsetPartitioner, batch_size=args.test_bsz, isTest=True, collate_fn=collate_fn)
+
+    stop_flag = Value(c_bool, False)
+
+    # no need to keep the raw data
+    del train_dataset, test_dataset
+
+    init_myprocesses(this_rank, world_size, model,
+                                          q, param_q, stop_flag,
+                                          run, args.backend, client_cfg)
+
